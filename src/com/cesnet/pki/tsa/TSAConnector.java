@@ -1,294 +1,277 @@
 package com.cesnet.pki.tsa;
 
-import java.io.*;
-import java.math.BigInteger;
+import org.bouncycastle.asn1.ASN1InputStream;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.tsp.TimeStampResp;
+import org.bouncycastle.crypto.digests.*;
+import org.bouncycastle.tsp.*;
+
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
 import java.net.URL;
-import java.net.URLConnection;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Scanner;
 
-import org.bouncycastle.asn1.*;
-import org.bouncycastle.asn1.tsp.TimeStampResp;
-import org.bouncycastle.crypto.digests.SHA1Digest;
-import org.bouncycastle.crypto.digests.SHA256Digest;
-import org.bouncycastle.tsp.*;
-
 /**
- * TODO: verify output
- * TODO: doublecheck <a href="http://www.ietf.org/rfc/rfc3161.txt">RFC 3161</a> compliance
+ * Status: Beta
  *
- * Status: in development
+ * doublecheck <a href="http://www.ietf.org/rfc/rfc3161.txt">RFC 3161</a> compliance
  *
  * Created by Petr Vsetecka on 3. 2. 2016.
  */
 public class TSAConnector {
-    private final boolean verbose = false;
-    private String[] hosts;
 
     public static void main(String[] args) {
-        String[] hosts = new String[2];
-        hosts[0] = "http://tsa.cesnet.cz:3161/tsa";
-        hosts[1] = "http://tsa2.cesnet.cz:3161/tsa";
+        final String responseExt = ".tsr";
+        String server = "http://tsa.cesnet.cz:3161/tsa";
+
+        GeneralDigest digestAlgorithm = new SHA256Digest();           // todo: can these two be put together?
+        ASN1ObjectIdentifier requestAlgorithm = TSPAlgorithms.SHA256; // they are different packages and have nothing in common..
 
         System.out.println("TSA Connector");
-        System.out.println("Note that only .txt files without punctuation are supported at the moment.");
-        System.out.println();
-        System.out.print("Please type name of your file with extension: ");
+        System.out.print("Specify file to stamp (with extension): ");
 
         Scanner sc = new Scanner(System.in);
-        String file = sc.nextLine();
+        String filename = sc.nextLine();
 
         System.out.println();
 
-        TSAConnector tsa = new TSAConnector(hosts);
-        tsa.stamp(file);
-        //System.out.println(tsa.compareByte(tsa.readFileByte("data.tsr"), tsa.readFileByte("data2.tsr")));
-    }
+        TSAConnector connector = new TSAConnector();
 
-    /**
-     * constructor
-     *
-     * @param url array or TSA's addresses
-     */
-    public TSAConnector(String[] url) {
-        this.hosts = url;
-    }
-
-    /**
-     * method for verification of internet connection
-     * for debug purposes
-     *
-     * @return
-     */
-    private boolean ping() {
-        String url = "http://www.google.com";
-        boolean available;
-        try{
-            final URLConnection connection = new URL(url).openConnection();
-            connection.connect();
-            System.out.println("Internet connection working.");
-            available = true;
-        } catch(final MalformedURLException e){
-            throw new IllegalStateException("Bad URL: " + url, e);
-        } catch(final IOException e){
-            System.out.println("Failed to connect to internet.");
-            e.printStackTrace();
-            available = false;
+        // read file
+        byte[] data;
+        try {
+            data = connector.readFileByte(filename);
+        } catch (IOException e) {
+            System.out.println("Could not open specified file, terminating.");
+            return;
         }
 
-        return available;
-    }
+        // create request
+        TimeStampRequest tsq = connector.getTSRequest(data, digestAlgorithm, requestAlgorithm);
 
-    /**
-     * generates digest hash using SHA256 algorithm
-     *
-     * @param input
-     * @return
-     */
-    private byte[] calculateMessageDigest(String input) {
-        //SHA1Digest md = new SHA1Digest(); // returns same data as openssl command - good for testing
-        SHA256Digest md = new SHA256Digest();
-
-        byte[] dataBytes = input.getBytes();
-        int nread = dataBytes.length;
-        md.update(dataBytes, 0, nread);
-        byte[] result = new byte[32];
-        int size = md.doFinal(result, 0);
-
-        return Arrays.copyOfRange(result, 0, size);
-    }
-
-    /**
-     * reads contents of text file
-     *
-     * @param file
-     * @return
-     * @throws IOException
-     */
-    private byte[] readFile(String file) throws IOException {
-        Path path = Paths.get(file);
-        String data = String.join(System.lineSeparator(), Files.readAllLines(path));
-
-        return calculateMessageDigest(data);
-    }
-
-    /**
-     * reads byte data of file
-     *
-     * @param file
-     * @return
-     * @throws IOException
-     */
-    private byte[] readFileByte(String file) throws IOException {
-        Path path = Paths.get(file);
-        byte[] data = Files.readAllBytes(path);
-
-        return data;
-    }
-
-    /**
-     * compares two byte arrays
-     * for debug purposes
-     *
-     * @param data1
-     * @param data2
-     * @return
-     */
-    private boolean compareByte(byte[] data1, byte[] data2) {
-        if (data1.length != data2.length) {
-            // different size
-            System.out.println("Different size!");
-            return false;
+        // send request and receive response
+        TimeStampResponse tsr = connector.getTSResponse(tsq, server);
+        if (tsr == null) {
+            return;
         }
 
-        System.out.println("Different bytes at:");
-        for (int i = 0; i < data1.length; i++) {
-            if (data1[i] != data2[i]) {
-                // different byte
-                System.out.print(i + " ");
-            }
-        }
         System.out.println();
 
-        return true;
+        // show reason of failure
+        if (tsr.getFailInfo() != null) {
+            connector.printFailReason(tsr.getFailInfo().intValue());
+            return;
+        }
+
+        // show response
+        connector.printResponse(tsr);
+
+        // get name
+        System.out.println();
+        System.out.print("Save response as: ");
+        String saveName = sc.nextLine();
+        if (!saveName.endsWith(responseExt)) {
+            saveName = saveName.concat(responseExt);
+        }
+
+        // save response to file
+        try {
+            connector.saveToFile(saveName, tsr.getEncoded());
+            System.out.println("TimeStamp Response successfully saved as: ".concat(filename));
+        } catch (IOException e) {
+            System.out.println("Save to file ".concat(saveName).concat(" failed."));
+        }
     }
 
     /**
-     * generates TS request (equivalent to .tsq file)
+     * reads byte data of specified file
      *
      * @param filename
      * @return
      * @throws IOException
      */
-    private TimeStampRequest getTimeStampRequest(String filename) throws IOException {
-        TimeStampRequestGenerator timeStampRequestGenerator = new TimeStampRequestGenerator();
-        //timeStampRequestGenerator.setReqPolicy(new ASN1ObjectIdentifier("1.3.6.1.4.1.13762.3")); // not supported in CESNET
-        //byte[] digest = calculateMessageDigest("data");
-        byte[] digest = readFile(filename);
-        TimeStampRequest timeStampRequest = timeStampRequestGenerator.generate(TSPAlgorithms.SHA256, digest);
-        //TimeStampRequest timeStampRequest = timeStampRequestGenerator.generate(TSPAlgorithms.SHA1, new byte[20], BigInteger.valueOf(100));
+    private byte[] readFileByte(String filename) throws IOException {
+        Path path = Paths.get(filename);
 
-        // for debugging
-        if (verbose) {
-            byte[] request = timeStampRequest.getEncoded();
-            System.out.println("Request byte data:");
-            byte[] shouldBe = readFileByte("data.tsq");
-
-            System.out.println("target:");
-            for (byte b : shouldBe) {
-                System.out.print((int) b + " ");
-            }
-            System.out.println();
-            System.out.println();
-
-            System.out.println("digest:");
-            for (byte b : digest) {
-                System.out.print((int) b + " ");
-            }
-            System.out.println();
-            System.out.println();
-
-            System.out.println("generated:");
-            for (byte b : request) {
-                System.out.print((int) b + " ");
-            }
-            System.out.println();
-            System.out.println();
-
-                /*
-                byte[] answer = readFileByte("data.tsr");
-                System.out.println("answer:");
-                for (byte b : answer) {
-                    System.out.print((char) b + "");
-                }
-                System.out.println();
-                System.out.println();//*/
-        }
-
-        return timeStampRequest;
+        return Files.readAllBytes(path);
     }
 
     /**
-     * tries to establish connection with some server from @hosts
+     * generates TS request (equivalent to .tsq file)
      *
+     * The TimeStampReq ASN.1 type has the following definition:
+     * <pre>
+     *
+     *     TimeStampReq ::= SEQUENCE {
+     *         version           INTEGER { v1(1) },
+     *         messageImprint    MessageImprint
+     *           -- a hash algorithm OID and the hash value of the data to be
+     *           -- time-stamped.
+     *         reqPolicy         TSAPolicyId    OPTIONAL,
+     *         nonce             INTEGER        OPTIONAL,
+     *         certReq           BOOLEAN        DEFAULT FALSE,
+     *         extensions        [0] IMPLICIT Extensions OPTIONAL }
+     *
+     *     MessageImprint ::= SEQUENCE {
+     *         hashAlgorithm     AlgorithmIdentifier,
+     *         hashedMessage     OCTET STRING }
+     *
+     *     TSAPolicyId ::= OBJECT IDENTIFIER
+     *
+     * </pre>
+     *
+     * @param data
+     * @param digestAlg
+     * @param requestAlg
      * @return
-     * @throws IOException
      */
-    private HttpURLConnection openConnection() throws IOException {
-        URL url;
-        HttpURLConnection con = null;
-        boolean success = false;
-        IOException e = null;
+    private TimeStampRequest getTSRequest(byte[] data, GeneralDigest digestAlg, ASN1ObjectIdentifier requestAlg) {
+        TimeStampRequestGenerator tsqGenerator = new TimeStampRequestGenerator();
+        byte[] digest = calculateMessageDigest(data, digestAlg);
 
-        for (String host : hosts) {
-            try {
-                url = new URL(host);
-                con = (HttpURLConnection) url.openConnection();
-                success = true;
-                break;
-            } catch (IOException e1) {
-                e = e1;
-            }
-        }
-
-        if (!success) {
-            throw e;
-        }
-
-        return con;
+        return tsqGenerator.generate(requestAlg, digest);
     }
 
     /**
-     * receives response
+     * generates digest hash using specified algorithm
      *
-     * @param con
+     * @param message
+     * @param messageDigest
      * @return
-     * @throws IOException
      */
-    private TimeStampResp getResponse(HttpURLConnection con) throws IOException {
-        if (con.getResponseCode() != HttpURLConnection.HTTP_OK) {
-            throw new IOException("Received HTTP error: " + con.getResponseCode() + " - " + con.getResponseMessage());
-        } else {
-            System.out.println("Response Code: ".concat(Integer.toString(con.getResponseCode())));
+    private byte[] calculateMessageDigest(byte[] message, GeneralDigest messageDigest) {
+        int length = message.length;
+        messageDigest.update(message, 0, length);
+        byte[] result = new byte[32];
+        int size = messageDigest.doFinal(result, 0);
+
+        return Arrays.copyOfRange(result, 0, size);
+    }
+
+    /**
+     * sends TS Request and receives an answer (equivalent to .tsr file)
+     *
+     * The TimeStampResp ASN.1 type has the following definition:
+     * <pre>
+     *
+     *     TimeStampResp ::= SEQUENCE {
+     *         status            PKIStatusInfo,
+     *         timeStampToken    TimeStampToken OPTIONAL ]
+     *
+     *     PKIStatusInfo ::= SEQUENCE {
+     *         status        PKIStatus,
+     *         statusString  PKIFreeText OPTIONAL,
+     *         failInfo      PKIFailureInfo OPTIONAL }
+     *
+     *     PKIStatus ::= INTEGER {
+     *         granted                (0),
+     *           -- when the PKIStatus contains the value zero a TimeStampToken, as
+     *           -- requested, is present.
+     *         grantedWithMods        (1),
+     *           -- when the PKIStatus contains the value one a TimeStampToken,
+     *           -- with modifications, is present.
+     *         rejection              (2),
+     *         waiting                (3),
+     *         revocationWarning      (4),
+     *           -- this message contains a warning that a revocation is
+     *           -- imminent
+     *         revocationNotification (5)
+     *           -- notification that a revocation has occurred }
+     *
+     *     PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
+     *           -- text encoded as UTF-8 String (note:  each UTF8String SHOULD
+     *           -- include an RFC 1766 language tag to indicate the language
+     *           -- of the contained text)
+     *
+     *     PKIFailureInfo ::= BIT STRING {
+     *         badAlg              (0),
+     *           -- unrecognized or unsupported Algorithm Identifier
+     *         badRequest          (2),
+     *           -- transaction not permitted or supported
+     *         badDataFormat       (5),
+     *           -- the data submitted has the wrong format
+     *         timeNotAvailable    (14),
+     *           -- the TSA's time source is not available
+     *         unacceptedPolicy    (15),
+     *           -- the requested TSA policy is not supported by the TSA
+     *         unacceptedExtension (16),
+     *           -- the requested extension is not supported by the TSA
+     *         addInfoNotAvailable (17)
+     *           -- the additional information requested could not be understood
+     *           -- or is not available
+     *         systemFailure       (25)
+     *           -- the request cannot be handled due to system failure }
+     *
+     *     TimeStampToken ::= ContentInfo
+     *         -- contentType is id-signedData
+     *         -- content is SignedData
+     *         -- eContentType within SignedData is id-ct-TSTInfo
+     *         -- eContent within SignedData is TSTInfo
+     *
+     * </pre>
+
+     * @param tsq
+     * @param server
+     * @return
+     */
+    private TimeStampResponse getTSResponse(TimeStampRequest tsq, String server) {
+        // open valid connection
+        HttpURLConnection con;
+        try {
+            URL url = new URL(server);
+            con = (HttpURLConnection) url.openConnection();
+        } catch (IOException e) {
+            System.out.println("The TSA server couldn't be contacted.");
+            return null;
         }
-        InputStream in = con.getInputStream();
-            /* // snippet for verification of received data
-            int i, size = 0;
-            char c;
-            byte[] data1 = new byte[776];
-            while((i=in.read())!=-1)
-            {
-                // converts integer to character
-                //c=(char)i;
+        con.setDoOutput(true);
+        con.setDoInput(true);
+        con.setRequestProperty("Content-type", "application/timestamp-query");
 
-                // prints character
-                //System.out.print(c);
-                data1[size] = (byte) i;
-                size++;
+        // send request
+        OutputStream out;
+        try {
+            out = con.getOutputStream();
+            out.write(tsq.getEncoded()); // byte array
+            out.flush();
+        } catch (IOException e) {
+            System.out.println("Failed to send the TS request.");
+            return null;
+        }
+
+        // receive response
+        InputStream in;
+        TimeStampResp resp;
+        TimeStampResponse response;
+        try {
+            // verify connection status
+            if (con.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                throw new IOException("Received HTTP error: " + con.getResponseCode() + " - " + con.getResponseMessage());
+            } else {
+                System.out.println("Response Code: ".concat(Integer.toString(con.getResponseCode())));
             }
+            // accept the answer
+            in = con.getInputStream();
+            resp = TimeStampResp.getInstance(new ASN1InputStream(in).readObject());
+            response = new TimeStampResponse(resp);
+            // verify the answer
+            response.validate(tsq);
 
-            Path path2 = Paths.get("data.tsr");
-            byte[] data2 = Files.readAllBytes(path2);
+            System.out.println("Status = ".concat((response.getStatusString() == null) ? "response accepted" :
+                    response.getStatusString()));
+        } catch (TSPException | IOException e) {
+            System.out.println("Cannot interpret incoming data.");
+            return null;
+        }
 
-            for (int j = 0; j < data1.length; j++) {
-                if (data1[j] != data2[j]) {
-                    // different byte
-                    System.out.print(j + " ");
-                }
-            }
-
-            System.out.println("\nResponse length: "+size);
-
-            if (size > 0)
-                return;//*/
-
-        return TimeStampResp.getInstance(new ASN1InputStream(in).readObject());
+        return response;
     }
 
     /**
@@ -368,99 +351,15 @@ public class TSAConnector {
     }
 
     /**
-     * saves data to file
+     * saves byte data to specified file
      *
      * @param filename
      * @param data
      * @throws IOException
      */
     private void saveToFile(String filename, byte[] data) throws IOException {
-        FileOutputStream fos = new FileOutputStream(filename);
-        fos.write(data);
-        fos.close();
-    }
-
-    /**
-     * sends the TSA request, receives an answer and interprets it
-     *
-     * @param filename name of the file with extension
-     */
-    private void stamp(String filename) {
-        //System.setProperty("http.proxyHost", hostname);
-        //System.setProperty("http.proxyPort", port);
-
-        // create request
-        TimeStampRequest tsq;
-        byte[] request;
-        try {
-            tsq = getTimeStampRequest(filename);
-            request = tsq.getEncoded();
-        } catch (IOException e) {
-            System.out.println("Failed to create the TS Request.");
-            e.printStackTrace();
-            return;
-        }
-
-        // open valid connection
-        HttpURLConnection con;
-        try {
-            con = openConnection();
-        } catch (IOException e) {
-            System.out.println("No TSA server could be contacted.");
-            e.printStackTrace();
-            return;
-        }
-        con.setDoOutput(true);
-        con.setDoInput(true);
-        //con.setRequestMethod("POST");
-        con.setRequestProperty("Content-type", "application/timestamp-query");
-        //con.setRequestProperty("Content-length", String.valueOf(request.length));
-
-        // send request
-        OutputStream out;
-        try {
-            out = con.getOutputStream();
-            out.write(request);
-            out.flush();
-        } catch (IOException e) {
-            System.out.println("Failed to send the TS request.");
-            e.printStackTrace();
-            return;
-        }
-
-        // receive response
-        TimeStampResp resp;
-        TimeStampResponse response;
-        try {
-            resp = getResponse(con);
-            response = new TimeStampResponse(resp);
-            response.validate(tsq);
-            System.out.println("Status = ".concat((response.getStatusString() == null) ? "null (seems it means \"OK\")" :
-                    response.getStatusString()));
-        } catch (TSPException | IOException e) {
-            System.out.println("Cannot interpret incoming data.");
-            e.printStackTrace();
-            return;
-        }
-
-        // show reason of failure
-        if (response.getFailInfo() != null) {
-            printFailReason(response.getFailInfo().intValue());
-            return;
-        }
-
-        // show response
-        printResponse(response);
-
-        // save response to file
-        String saveName = filename.substring(0, filename.lastIndexOf(".")).concat(".tsr");
-        try {
-            saveToFile(saveName, resp.getEncoded());
-            System.out.println();
-            System.out.println("TimeStamp Response successfully saved as: ".concat(saveName));
-        } catch (IOException e) {
-            System.out.println("Save to file ".concat(filename).concat(" failed."));
-            e.printStackTrace();
-        }
+            FileOutputStream fos = new FileOutputStream(filename);
+            fos.write(data);
+            fos.close();
     }
 }

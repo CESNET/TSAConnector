@@ -1,5 +1,8 @@
 package com.cesnet.pki.tsa;
 
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+
 import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.tsp.TimeStampResp;
@@ -26,21 +29,24 @@ import java.util.Scanner;
  * Created by Petr Vsetecka on 3. 2. 2016.
  */
 public class TSAConnector {
+    private static final Logger logger = LogManager.getLogger();
 
     public static void main(String[] args) {
-        final String responseExt = ".tsr";
-        String server = "http://tsa.cesnet.cz:3161/tsa";
+        logger.entry(args);
+        final String server = "http://tsa.cesnet.cz:3161/tsa";
 
         GeneralDigest digestAlgorithm = new SHA256Digest();           // todo: can these two be put together?
         ASN1ObjectIdentifier requestAlgorithm = TSPAlgorithms.SHA256; // they are different packages and have nothing in common..
+        logger.info("Algorithm used: {}", digestAlgorithm.getAlgorithmName());
 
-        System.out.println("TSA Connector");
-        System.out.print("Specify file to stamp (with extension): ");
+        /*=== Temporary UI start ===*/
+        System.out.print("\nSpecify file to stamp (with extension): ");
 
         Scanner sc = new Scanner(System.in);
         String filename = sc.nextLine();
 
         System.out.println();
+        /*=== Temporary UI end ===*/
 
         TSAConnector connector = new TSAConnector();
 
@@ -49,45 +55,53 @@ public class TSAConnector {
         try {
             data = connector.readFileByte(filename);
         } catch (IOException e) {
-            System.out.println("Could not open specified file, terminating.");
+            logger.error("Cannot open file '{}', terminating.", filename);
+            logger.throwing(e);
             return;
         }
+        logger.debug("file '{}' was read", filename);
 
         // create request
-        TimeStampRequest tsq = connector.getTSRequest(data, digestAlgorithm, requestAlgorithm);
+        byte[] digest = connector.calculateMessageDigest(data, digestAlgorithm);
+        TimeStampRequest tsq = connector.getTSRequest(digest, requestAlgorithm);
+        logger.debug("TS request generated");
 
         // send request and receive response
-        TimeStampResponse tsr = connector.getTSResponse(tsq, server);
-        if (tsr == null) {
+        TimeStampResponse tsr;
+        try {
+            tsr = connector.getTSResponse(tsq, server);
+        } catch (IOException | TSPException e) {
+            logger.throwing(e);
             return;
         }
+        logger.debug("TSA response received");
 
-        System.out.println();
-
-        // show reason of failure
+        // log reason of failure
         if (tsr.getFailInfo() != null) {
-            connector.printFailReason(tsr.getFailInfo().intValue());
+            connector.logFailReason(tsr.getFailInfo().intValue());
             return;
         }
 
-        // show response
-        connector.printResponse(tsr);
+        // log response
+        connector.logResponse(tsr);
 
         // get name
+        /*=== Temporary UI start ===*/
         System.out.println();
         System.out.print("Save response as: ");
         String saveName = sc.nextLine();
-        if (!saveName.endsWith(responseExt)) {
-            saveName = saveName.concat(responseExt);
-        }
+        System.out.println();
+        /*=== Temporary UI end ===*/
 
         // save response to file
         try {
             connector.saveToFile(saveName, tsr.getEncoded());
-            System.out.println("TimeStamp Response successfully saved as: ".concat(filename));
+            logger.info("TimeStamp Response successfully saved as: {}", saveName);
         } catch (IOException e) {
-            System.out.println("Save to file ".concat(saveName).concat(" failed."));
+            logger.error("Save to file '{}' failed.", saveName);
+            logger.throwing(e);
         }
+        logger.exit();
     }
 
     /**
@@ -104,9 +118,9 @@ public class TSAConnector {
     }
 
     /**
-     * generates TS request (equivalent to .tsq file)
+     * generates TS request with following definition
      *
-     * The TimeStampReq ASN.1 type has the following definition:
+     * The TimeStampReq ASN.1 type definition:
      * <pre>
      *
      *     TimeStampReq ::= SEQUENCE {
@@ -127,38 +141,37 @@ public class TSAConnector {
      *
      * </pre>
      *
-     * @param data
-     * @param digestAlg
+     * @param digest
      * @param requestAlg
      * @return
      */
-    private TimeStampRequest getTSRequest(byte[] data, GeneralDigest digestAlg, ASN1ObjectIdentifier requestAlg) {
+    private TimeStampRequest getTSRequest(byte[] digest, ASN1ObjectIdentifier requestAlg) {
         TimeStampRequestGenerator tsqGenerator = new TimeStampRequestGenerator();
-        byte[] digest = calculateMessageDigest(data, digestAlg);
 
         return tsqGenerator.generate(requestAlg, digest);
     }
 
     /**
-     * generates digest hash using specified algorithm
+     * computes digest hash using specified algorithm
      *
-     * @param message
-     * @param messageDigest
+     * @param message - base from which the digest will be computed (i.e. file to be stamped)
+     * @param messageDigest - algorithm used to calculate the digest
      * @return
      */
     private byte[] calculateMessageDigest(byte[] message, GeneralDigest messageDigest) {
-        int length = message.length;
-        messageDigest.update(message, 0, length);
-        byte[] result = new byte[32];
-        int size = messageDigest.doFinal(result, 0);
+        messageDigest.update(message, 0, message.length); // offset - '0' means start from the beginning
+                                                          // digest obviously has to be computed from whole message
+        byte[] result = new byte[messageDigest.getDigestSize()];
+        int size = messageDigest.doFinal(result, 0); // offset - '0' means start from the beginning
 
-        return Arrays.copyOfRange(result, 0, size);
+        // return only valid part of digest (can be shorter than maximum digest size)
+        return Arrays.copyOfRange(result, 0, size); // offset - '0' means start from the beginning
     }
 
     /**
-     * sends TS Request and receives an answer (equivalent to .tsr file)
+     * sends TS Request and receives an answer in following definition
      *
-     * The TimeStampResp ASN.1 type has the following definition:
+     * The TimeStampResp ASN.1 type definition:
      * <pre>
      *
      *     TimeStampResp ::= SEQUENCE {
@@ -221,30 +234,35 @@ public class TSAConnector {
      * @param server
      * @return
      */
-    private TimeStampResponse getTSResponse(TimeStampRequest tsq, String server) {
+    private TimeStampResponse getTSResponse(TimeStampRequest tsq, String server) throws IOException, TSPException {
+        logger.entry(tsq, server);
+        final byte[] request = tsq.getEncoded();
         // open valid connection
         HttpURLConnection con;
         try {
             URL url = new URL(server);
             con = (HttpURLConnection) url.openConnection();
         } catch (IOException e) {
-            System.out.println("The TSA server couldn't be contacted.");
-            return null;
+            logger.error("TSA server couldn't be contacted");
+            throw e;
         }
         con.setDoOutput(true);
         con.setDoInput(true);
         con.setRequestProperty("Content-type", "application/timestamp-query");
+        con.setRequestProperty("Content-length", String.valueOf(request.length));
+        logger.info("TSA server was successfully contacted");
 
         // send request
         OutputStream out;
         try {
             out = con.getOutputStream();
-            out.write(tsq.getEncoded()); // byte array
+            out.write(request);
             out.flush();
         } catch (IOException e) {
-            System.out.println("Failed to send the TS request.");
-            return null;
+            logger.error("Failed to send the TS request.");
+            throw e;
         }
+        logger.debug("TS request sent");
 
         // receive response
         InputStream in;
@@ -255,7 +273,7 @@ public class TSAConnector {
             if (con.getResponseCode() != HttpURLConnection.HTTP_OK) {
                 throw new IOException("Received HTTP error: " + con.getResponseCode() + " - " + con.getResponseMessage());
             } else {
-                System.out.println("Response Code: ".concat(Integer.toString(con.getResponseCode())));
+                logger.debug("Response Code: {}", con.getResponseCode());
             }
             // accept the answer
             in = con.getInputStream();
@@ -263,15 +281,14 @@ public class TSAConnector {
             response = new TimeStampResponse(resp);
             // verify the answer
             response.validate(tsq);
-
-            System.out.println("Status = ".concat((response.getStatusString() == null) ? "response accepted" :
-                    response.getStatusString()));
         } catch (TSPException | IOException e) {
-            System.out.println("Cannot interpret incoming data.");
-            return null;
+            logger.error("Cannot interpret incoming data.");
+            throw e;
         }
 
-        return response;
+        logger.debug("Status: {}", response.getStatusString()); // null means OK
+
+        return logger.exit(response);
     }
 
     /**
@@ -279,50 +296,49 @@ public class TSAConnector {
      *
      * @param reason
      */
-    private void printFailReason(int reason) {
+    private void logFailReason(final int reason) {
         switch (reason) {
             case 0: {
-                System.out.println("unrecognized or unsupported Algorithm Identifier");
+                logger.error("unrecognized or unsupported Algorithm Identifier");
                 return;
             }
 
             case 2: {
-                System.out.println("transaction not permitted or supported");
+                logger.error("transaction not permitted or supported");
                 return;
             }
 
             case 5: {
-                System.out.println("the data submitted has the wrong format");
+                logger.error("the data submitted has the wrong format");
                 return;
             }
 
             case 14: {
-                System.out.println("the TSA's time source is not available");
+                logger.error("the TSA's time source is not available");
                 return;
             }
 
             case 15: {
-                System.out.println("the requested TSA policy is not supported by the TSA");
+                logger.error("the requested TSA policy is not supported by the TSA");
                 return;
             }
             case 16: {
-                System.out.println("the requested extension is not supported by the TSA");
+                logger.error("the requested extension is not supported by the TSA");
                 return;
             }
 
             case 17: {
-                System.out.println("the additional information requested could not be understood or is not available");
+                logger.error("the additional information requested could not be understood or is not available");
                 return;
             }
 
             case 25: {
-                System.out.println("the request cannot be handled due to system failure");
+                logger.error("the request cannot be handled due to system failure");
                 return;
             }
 
             default: {
-                System.out.println("Unknown (CESNET specific) error occurred!\n" +
-                        "Error code ("+reason+") not specified in RFC 3161 standard.");
+                logger.error("Unknown error occurred! Error code ({}) not specified in RFC 3161 standard.", reason);
             }
         }
     }
@@ -332,22 +348,11 @@ public class TSAConnector {
      *
      * @param tsr
      */
-    private void printResponse(TimeStampResponse tsr) {
-        System.out.print("Timestamp: ");
-        System.out.println(tsr.getTimeStampToken().getTimeStampInfo().getGenTime() == null ? "null" :
-                tsr.getTimeStampToken().getTimeStampInfo().getGenTime());
-
-        System.out.print("TSA: ");
-        System.out.println(tsr.getTimeStampToken().getTimeStampInfo().getTsa() == null ? "null" :
-                tsr.getTimeStampToken().getTimeStampInfo().getTsa());
-
-        System.out.print("Serial number: ");
-        System.out.println(tsr.getTimeStampToken().getTimeStampInfo().getSerialNumber() == null ? "null" :
-                tsr.getTimeStampToken().getTimeStampInfo().getSerialNumber());
-
-        System.out.print("Policy: ");
-        System.out.println(tsr.getTimeStampToken().getTimeStampInfo().getPolicy() == null ? "null" :
-                tsr.getTimeStampToken().getTimeStampInfo().getPolicy());
+    private void logResponse(final TimeStampResponse tsr) {
+        logger.info("Timestamp: {}", tsr.getTimeStampToken().getTimeStampInfo().getGenTime());
+        logger.info("TSA: {}", tsr.getTimeStampToken().getTimeStampInfo().getTsa());
+        logger.info("Serial number: {}", tsr.getTimeStampToken().getTimeStampInfo().getSerialNumber());
+        logger.info("Policy: {}", tsr.getTimeStampToken().getTimeStampInfo().getPolicy());
     }
 
     /**
@@ -357,7 +362,7 @@ public class TSAConnector {
      * @param data
      * @throws IOException
      */
-    private void saveToFile(String filename, byte[] data) throws IOException {
+    private void saveToFile(final String filename, final byte[] data) throws IOException {
             FileOutputStream fos = new FileOutputStream(filename);
             fos.write(data);
             fos.close();

@@ -1,11 +1,11 @@
 package com.cesnet.pki.tsa;
 
-import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
-
+import org.apache.logging.log4j.Logger;
 import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.tsp.TimeStampResp;
+import org.bouncycastle.crypto.ExtendedDigest;
 import org.bouncycastle.crypto.digests.*;
 import org.bouncycastle.tsp.*;
 
@@ -23,21 +23,17 @@ import java.util.Scanner;
 
 /**
  * Status: Beta
- *
+ * <p>
  * doublecheck <a href="http://www.ietf.org/rfc/rfc3161.txt">RFC 3161</a> compliance
- *
+ * <p>
  * Created by Petr Vsetecka on 3. 2. 2016.
  */
 public class TSAConnector {
     private static final Logger logger = LogManager.getLogger();
 
     public static void main(String[] args) {
-        logger.entry(args);
+        logger.entry();
         final String server = "http://tsa.cesnet.cz:3161/tsa";
-
-        GeneralDigest digestAlgorithm = new SHA256Digest();           // todo: can these two be put together?
-        ASN1ObjectIdentifier requestAlgorithm = TSPAlgorithms.SHA256; // they are different packages and have nothing in common..
-        logger.info("Algorithm used: {}", digestAlgorithm.getAlgorithmName());
 
         /*=== Temporary UI start ===*/
         System.out.print("\nSpecify file to stamp (with extension): ");
@@ -50,13 +46,23 @@ public class TSAConnector {
 
         TSAConnector connector = new TSAConnector();
 
+        ExtendedDigest digestAlgorithm = new SHA256Digest(); // select hash algorithm
+        ASN1ObjectIdentifier requestAlgorithm;
+        try {
+            requestAlgorithm = connector.getHashObjectIdentifier(digestAlgorithm.getAlgorithmName());
+        } catch (IllegalArgumentException e) {
+            logger.catching(e);
+            return;
+        }
+        logger.info("Selected algorithm: {}", digestAlgorithm.getAlgorithmName());
+
         // read file
         byte[] data;
         try {
             data = connector.readFileByte(filename);
         } catch (IOException e) {
             logger.error("Cannot open file '{}', terminating.", filename);
-            logger.throwing(e);
+            logger.catching(e);
             return;
         }
         logger.debug("file '{}' was read", filename);
@@ -71,7 +77,7 @@ public class TSAConnector {
         try {
             tsr = connector.getTSResponse(tsq, server);
         } catch (IOException | TSPException e) {
-            logger.throwing(e);
+            logger.catching(e);
             return;
         }
         logger.debug("TSA response received");
@@ -99,16 +105,42 @@ public class TSAConnector {
             logger.info("TimeStamp Response successfully saved as: {}", saveName);
         } catch (IOException e) {
             logger.error("Save to file '{}' failed.", saveName);
-            logger.throwing(e);
+            logger.catching(e);
         }
         logger.exit();
     }
 
     /**
-     * reads byte data of specified file
+     * returns the ASN.1 OID of the given hash algorithm
      *
-     * @param filename
-     * @return
+     * @param algorithm {@link org.bouncycastle.crypto.Digest} hash algorithm name
+     * @return the ASN.1 OID of the given hash algorithm
+     * @throws IllegalArgumentException when unsupported algorithm is chosen
+     */
+    private ASN1ObjectIdentifier getHashObjectIdentifier(final String algorithm) throws IllegalArgumentException {
+        switch (algorithm) {
+            case "MD5":
+                return TSPAlgorithms.MD5;
+            case "SHA-1":
+                return TSPAlgorithms.SHA1;
+            case "SHA-224":
+                return TSPAlgorithms.SHA224;
+            case "SHA-256":
+                return TSPAlgorithms.SHA256;
+            case "SHA-384":
+                return TSPAlgorithms.SHA384;
+            case "SHA-512":
+                return TSPAlgorithms.SHA512;
+            default:
+                throw new IllegalArgumentException(algorithm + " not a supported algorithm");
+        }
+    }
+
+    /**
+     * reads binary data of specified file
+     *
+     * @param filename file to be opened
+     * @return file byte data
      * @throws IOException
      */
     private byte[] readFileByte(String filename) throws IOException {
@@ -118,8 +150,25 @@ public class TSAConnector {
     }
 
     /**
-     * generates TS request with following definition
+     * computes digest hash using specified algorithm
      *
+     * @param message       base from which the digest will be computed (i.e. file to be stamped)
+     * @param messageDigest algorithm used to calculate the digest
+     * @return calculated digest
+     */
+    private byte[] calculateMessageDigest(byte[] message, ExtendedDigest messageDigest) {
+        messageDigest.update(message, 0, message.length); // offset - '0' means start from the beginning
+        // digest obviously has to be computed from whole message
+        byte[] digest = new byte[messageDigest.getDigestSize()];
+        int size = messageDigest.doFinal(digest, 0); // offset - '0' means start from the beginning
+
+        // return only valid part of digest (can be shorter than maximum digest size)
+        return Arrays.copyOfRange(digest, 0, size); // offset - '0' means start from the beginning
+    }
+
+    /**
+     * generates TS request with following definition
+     * <p>
      * The TimeStampReq ASN.1 type definition:
      * <pre>
      *
@@ -141,9 +190,10 @@ public class TSAConnector {
      *
      * </pre>
      *
-     * @param digest
-     * @param requestAlg
-     * @return
+     * @param digest     digest calculated using some hashing algorithm
+     * @param requestAlg algorithm specification for {@link TimeStampRequestGenerator}
+     *                   it has to correspond to algorithm used to calculate @param digest
+     * @return TimeStamp Request as defined above
      */
     private TimeStampRequest getTSRequest(byte[] digest, ASN1ObjectIdentifier requestAlg) {
         TimeStampRequestGenerator tsqGenerator = new TimeStampRequestGenerator();
@@ -152,25 +202,8 @@ public class TSAConnector {
     }
 
     /**
-     * computes digest hash using specified algorithm
-     *
-     * @param message - base from which the digest will be computed (i.e. file to be stamped)
-     * @param messageDigest - algorithm used to calculate the digest
-     * @return
-     */
-    private byte[] calculateMessageDigest(byte[] message, GeneralDigest messageDigest) {
-        messageDigest.update(message, 0, message.length); // offset - '0' means start from the beginning
-                                                          // digest obviously has to be computed from whole message
-        byte[] result = new byte[messageDigest.getDigestSize()];
-        int size = messageDigest.doFinal(result, 0); // offset - '0' means start from the beginning
-
-        // return only valid part of digest (can be shorter than maximum digest size)
-        return Arrays.copyOfRange(result, 0, size); // offset - '0' means start from the beginning
-    }
-
-    /**
      * sends TS Request and receives an answer in following definition
-     *
+     * <p>
      * The TimeStampResp ASN.1 type definition:
      * <pre>
      *
@@ -229,12 +262,13 @@ public class TSAConnector {
      *         -- eContent within SignedData is TSTInfo
      *
      * </pre>
-
-     * @param tsq
-     * @param server
-     * @return
+     *
+     * @param tsq    TimeStamp Request to be sent to TSA
+     * @param server complete URL of the TSA server
+     * @return TimeStamp Response created from TSA's response
      */
     private TimeStampResponse getTSResponse(TimeStampRequest tsq, String server) throws IOException, TSPException {
+        logger.trace("entering getTSResponse() method");
         logger.entry(tsq, server);
         final byte[] request = tsq.getEncoded();
         // open valid connection
@@ -292,9 +326,9 @@ public class TSAConnector {
     }
 
     /**
-     * prints reason of failure according to RFC 3161 standard
+     * prints reason of failure according to <a href="http://www.ietf.org/rfc/rfc3161.txt">RFC 3161</a> standard
      *
-     * @param reason
+     * @param reason intValue given by TSA server
      */
     private void logFailReason(final int reason) {
         switch (reason) {
@@ -344,9 +378,9 @@ public class TSAConnector {
     }
 
     /**
-     * prints response of TSA
+     * prints details of received TimeStamp
      *
-     * @param tsr
+     * @param tsr {@link TimeStampResponse}
      */
     private void logResponse(final TimeStampResponse tsr) {
         logger.info("Timestamp: {}", tsr.getTimeStampToken().getTimeStampInfo().getGenTime());
@@ -358,13 +392,13 @@ public class TSAConnector {
     /**
      * saves byte data to specified file
      *
-     * @param filename
-     * @param data
+     * @param filename save file
+     * @param data     binary data
      * @throws IOException
      */
     private void saveToFile(final String filename, final byte[] data) throws IOException {
-            FileOutputStream fos = new FileOutputStream(filename);
-            fos.write(data);
-            fos.close();
+        FileOutputStream fos = new FileOutputStream(filename);
+        fos.write(data);
+        fos.close();
     }
 }

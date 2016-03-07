@@ -19,7 +19,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
-import java.util.Scanner;
 
 /**
  * Status: Beta
@@ -35,16 +34,16 @@ public class TSAConnector {
         logger.entry();
         final String server = "http://tsa.cesnet.cz:3161/tsa";
 
-        /*=== Temporary UI start ===*/
-        System.out.print("\nSpecify file to stamp (with extension): ");
-
-        Scanner sc = new Scanner(System.in);
-        String filename = sc.nextLine();
-
-        System.out.println();
-        /*=== Temporary UI end ===*/
-
         TSAConnector connector = new TSAConnector();
+
+        if (args.length != 2) {
+            connector.showHelp();
+            return;
+        }
+
+        String filename = args[0];
+        String saveName = args[1];
+        logger.info("File to be stamped: {}", filename);
 
         ExtendedDigest digestAlgorithm = new SHA256Digest(); // select hash algorithm
         ASN1ObjectIdentifier requestAlgorithm;
@@ -90,14 +89,6 @@ public class TSAConnector {
 
         // log response
         connector.logResponse(tsr);
-
-        // get name
-        /*=== Temporary UI start ===*/
-        System.out.println();
-        System.out.print("Save response as: ");
-        String saveName = sc.nextLine();
-        System.out.println();
-        /*=== Temporary UI end ===*/
 
         // save response to file
         try {
@@ -156,7 +147,7 @@ public class TSAConnector {
      * @param messageDigest algorithm used to calculate the digest
      * @return calculated digest
      */
-    private byte[] calculateMessageDigest(byte[] message, ExtendedDigest messageDigest) {
+    protected byte[] calculateMessageDigest(byte[] message, ExtendedDigest messageDigest) {
         messageDigest.update(message, 0, message.length); // offset - '0' means start from the beginning
         // digest obviously has to be computed from whole message
         byte[] digest = new byte[messageDigest.getDigestSize()];
@@ -283,7 +274,7 @@ public class TSAConnector {
         con.setDoOutput(true);
         con.setDoInput(true);
         con.setRequestProperty("Content-type", "application/timestamp-query");
-        con.setRequestProperty("Content-length", String.valueOf(request.length));
+        //con.setRequestProperty("Content-length", String.valueOf(request.length));
         logger.info("TSA server was successfully contacted");
 
         // send request
@@ -331,6 +322,7 @@ public class TSAConnector {
      * @param reason intValue given by TSA server
      */
     private void logFailReason(final int reason) {
+        logger.error("TSA server returned error");
         switch (reason) {
             case 0: {
                 logger.error("unrecognized or unsupported Algorithm Identifier");
@@ -372,7 +364,7 @@ public class TSAConnector {
             }
 
             default: {
-                logger.error("Unknown error occurred! Error code ({}) not specified in RFC 3161 standard.", reason);
+                logger.error("unknown error - error code ({}) not corresponding to RFC 3161 standard.", reason);
             }
         }
     }
@@ -400,5 +392,14 @@ public class TSAConnector {
         FileOutputStream fos = new FileOutputStream(filename);
         fos.write(data);
         fos.close();
+    }
+
+    /**
+     * text displayed when wrong number of arguments provided
+     */
+    private void showHelp() {
+        logger.error("wrong number of arguments");
+        logger.error("obligatory arguments: filename_input filename_output");
+        logger.error("example: java -jar TSAConnector.jar file.in file.out");
     }
 }

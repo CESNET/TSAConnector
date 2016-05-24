@@ -9,6 +9,7 @@ import org.bouncycastle.crypto.ExtendedDigest;
 import org.bouncycastle.crypto.digests.*;
 import org.bouncycastle.tsp.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -18,7 +19,19 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
+import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.cms.DefaultCMSSignatureAlgorithmNameGenerator;
+import org.bouncycastle.cms.SignerInformationVerifier;
+import org.bouncycastle.cms.bc.BcRSASignerInfoVerifierBuilder;
+import org.bouncycastle.operator.DefaultDigestAlgorithmIdentifierFinder;
+import org.bouncycastle.operator.DefaultSignatureAlgorithmIdentifierFinder;
+import org.bouncycastle.operator.OperatorCreationException;
+import org.bouncycastle.operator.bc.BcDigestCalculatorProvider;
 
 /**
  * Status: Beta
@@ -29,11 +42,11 @@ import java.util.Arrays;
  */
 public class TSAConnector {
     private static final Logger logger = LogManager.getLogger();
+    public final String server = "http://tsa.cesnet.cz:3161/tsa";
 
+    // <editor-fold defaultstate="collapsed" desc="legacy main method for testing purposes">
+    /*/
     public static void main(String[] args) {
-        logger.entry();
-        final String server = "http://tsa.cesnet.cz:3161/tsa";
-
         TSAConnector connector = new TSAConnector();
 
         if (args.length != 2) {
@@ -43,62 +56,237 @@ public class TSAConnector {
 
         String filename = args[0];
         String saveName = args[1];
-        logger.info("File to be stamped: {}", filename);
+    }
+    // */
+    // </editor-fold>
+    
+    /**
+     * Main method for stamping given file.
+     * It serves as an example of whole process in one go.
+     * 
+     * @param filename
+     * @param is
+     * @return  
+     * @throws java.io.IOException 
+     * @throws org.bouncycastle.tsp.TSPException 
+     */
+    public byte[] stamp(String filename, InputStream is) throws IOException, TSPException {
+        logger.entry();
 
+        logger.info("File to be stamped: {}", filename);
+        byte[] file = getBytesFromInputStream(is);
+        
         ExtendedDigest digestAlgorithm = new SHA256Digest(); // select hash algorithm
         ASN1ObjectIdentifier requestAlgorithm;
         try {
-            requestAlgorithm = connector.getHashObjectIdentifier(digestAlgorithm.getAlgorithmName());
+            requestAlgorithm = getHashObjectIdentifier(digestAlgorithm.getAlgorithmName());
         } catch (IllegalArgumentException e) {
             logger.catching(e);
-            return;
+            throw e;
         }
         logger.info("Selected algorithm: {}", digestAlgorithm.getAlgorithmName());
 
-        // read file
-        byte[] data;
-        try {
-            data = connector.readFileByte(filename);
-        } catch (IOException e) {
-            logger.error("Cannot open file '{}', terminating.", filename);
-            logger.catching(e);
-            return;
-        }
-        logger.debug("file '{}' was read", filename);
-
         // create request
-        byte[] digest = connector.calculateMessageDigest(data, digestAlgorithm);
-        TimeStampRequest tsq = connector.getTSRequest(digest, requestAlgorithm);
+        byte[] digest = calculateMessageDigest(file, digestAlgorithm);
+        TimeStampRequest tsq = getTSRequest(digest, requestAlgorithm);
         logger.debug("TS request generated");
 
         // send request and receive response
         TimeStampResponse tsr;
         try {
-            tsr = connector.getTSResponse(tsq, server);
+            tsr = getTSResponse(tsq, server);
         } catch (IOException | TSPException e) {
             logger.catching(e);
-            return;
+            throw e;
         }
         logger.debug("TSA response received");
 
         // log reason of failure
         if (tsr.getFailInfo() != null) {
-            connector.logFailReason(tsr.getFailInfo().intValue());
-            return;
+            logFailReason(tsr.getFailInfo().intValue());
+            return null;
         }
 
         // log response
-        connector.logResponse(tsr);
+        logResponse(tsr);
 
-        // save response to file
-        try {
-            connector.saveToFile(saveName, tsr.getEncoded());
-            logger.info("TimeStamp Response successfully saved as: {}", saveName);
-        } catch (IOException e) {
-            logger.error("Save to file '{}' failed.", saveName);
-            logger.catching(e);
-        }
         logger.exit();
+        return tsr.getEncoded();
+    }
+
+    /**
+     * Main method for validating files with stamps.
+     * It serves as an example of whole process in one go.
+     * 
+     * @param originalFile
+     * @param timeStamp
+     * @throws IOException
+     * @throws TSPException
+     * @throws CertificateException
+     * @throws CertificateEncodingException
+     * @throws OperatorCreationException 
+     */
+    public void verify(InputStream originalFile, InputStream timeStamp) throws IOException, TSPException, CertificateException, CertificateEncodingException, OperatorCreationException {
+        logger.entry();
+        
+        // open files
+        byte[] file = getBytesFromInputStream(originalFile);
+        TimeStampResponse tsr = parseTSR(timeStamp);
+        
+        logger.info("The timestamp was sucessfully opened.");
+        logResponse(tsr);
+        
+        // get hash algorithm
+        ASN1ObjectIdentifier algID = tsr.getTimeStampToken().getTimeStampInfo().getMessageImprintAlgOID();
+        GeneralDigest digestAlgorithm = getDigestAlg(algID);
+        
+        logger.info("The timestamp's algorithm was recognized as {}.", digestAlgorithm.getAlgorithmName());
+        
+        // create new hashed request
+        byte[] digest = calculateMessageDigest(file, digestAlgorithm);
+        TimeStampRequest tsq = getTSRequest(digest, algID);
+        
+        logger.info("The timestamp fits the file (the file was not changed), now verifying certificates..");
+        
+        InputStream is = null;
+        
+        if (is == null) {
+            throw new UnsupportedOperationException("Timestamp fits the file (the file was not changed), certificate not implemented yet.");
+        }
+        
+        // <editor-fold defaultstate="collapsed" desc="varianta 1 - ze souboru">
+        CertificateFactory factory;
+        X509Certificate cert;
+        try {
+            factory = CertificateFactory.getInstance("X.509");
+            cert = (X509Certificate) factory.generateCertificate(null); // TODO: get inputstream
+        } catch (CertificateException e) {
+            logger.catching(e);
+            throw e;
+        }
+
+        //RSA Signature processing with BC
+        X509CertificateHolder holder;
+        SignerInformationVerifier siv;
+        try {
+            holder = new X509CertificateHolder(cert.getEncoded());
+            siv = new BcRSASignerInfoVerifierBuilder(
+                    new DefaultCMSSignatureAlgorithmNameGenerator(), new DefaultSignatureAlgorithmIdentifierFinder(),
+                    new DefaultDigestAlgorithmIdentifierFinder(), new BcDigestCalculatorProvider()).build(holder);
+        } catch (CertificateEncodingException | OperatorCreationException e) {
+            logger.catching(e);
+            throw e;
+        }
+
+        //Signature processing with JCA and other provider
+        //X509CertificateHolder holderJca = new JcaX509CertificateHolder(cert);
+        //SignerInformationVerifier sivJca = new JcaSimpleSignerInfoVerifierBuilder().setProvider("anotherprovider").build(holderJca);
+
+        try {
+            tsr.getTimeStampToken().validate(siv);
+        } catch (TSPException e) {
+            logger.catching(e);
+            throw e;
+        }
+        /* konec varianty 1 */
+        // </editor-fold>
+        
+        // <editor-fold defaultstate="collapsed" desc="varianta 2 - z razitka">
+        /*/ get certificates
+        CollectionStore certs = (CollectionStore) tst.getCertificates();
+        SignerInformationStore signers = tst.toCMSSignedData().getSignerInfos();
+        
+        int certsCount = 0;
+        for (Iterator it = certs.iterator(); it.hasNext();) {
+            certsCount++; // stupid hack to get actual number of certificates
+        }
+        if (certsCount < 1) {
+            logger.error("No certificate found.");
+            return;
+        }
+        
+        for (SignerInformation signer : signers) {
+            Collection<X509Certificate> col = certs.getMatches(signer.getSID());
+            X509Certificate[] signerCerts = new X509Certificate[0];
+            col.toArray(signerCerts);
+            
+            if (signerCerts.length != 1) {
+                logger.error("Expected only one certificate per signer.");
+                return;
+            }
+            
+            try {
+                signerCerts[0].checkValidity();
+            } catch (CertificateExpiredException | CertificateNotYetValidException ex) {
+                java.util.logging.Logger.getLogger(TSAConnector.class.getName()).log(Level.SEVERE, null, ex);
+            }
+            
+//            signer.verify(signerCerts[0]); // should verify that the timestamp is signed correctly
+        }
+        /* konec varianty 2 */
+        // </editor-fold>
+        
+        logger.info("All certificates successfully verified, the timestamp is trusted.");
+        logger.exit();
+    }
+    
+    /**
+     * creates TimeStampResponse object
+     * 
+     * @param timeStamp
+     * @return
+     * @throws IOException
+     * @throws TSPException 
+     */
+    public TimeStampResponse parseTSR(InputStream timeStamp) throws IOException, TSPException {
+        TimeStampResponse tsr;
+        try {
+            tsr = new TimeStampResponse(timeStamp);
+        } catch (TSPException e) {
+            logger.catching(e);
+            throw e;
+        }
+        
+        return tsr;
+    }
+    
+    /**
+     * identifies supported algorithm
+     * 
+     * @param algID
+     * @return 
+     */
+    public GeneralDigest getDigestAlg(ASN1ObjectIdentifier algID) {
+        if (algID.equals(TSPAlgorithms.SHA1)) {
+            return new SHA1Digest();
+        } else if (algID.equals(TSPAlgorithms.SHA256)) {
+            return new SHA256Digest();
+        } else {
+            IllegalArgumentException e = new IllegalArgumentException("Selected timestamp was not created using supported (SHA-1 or SHA-256) algorithm.");
+            logger.catching(e);
+            throw e;
+        }
+    }
+    
+    /**
+     * method for JSP to create valid TimeStampRequest
+     * 
+     * @param file
+     * @param tsr
+     * @return 
+     */
+    public TimeStampRequest createCorrespondingTSQ(byte[] file, TimeStampResponse tsr) {
+        // get hash algorithm
+        ASN1ObjectIdentifier algID = tsr.getTimeStampToken().getTimeStampInfo().getMessageImprintAlgOID();
+        GeneralDigest digestAlgorithm = getDigestAlg(algID);
+        
+        logger.info("The timestamp's algorithm was recognized as {}.", digestAlgorithm.getAlgorithmName());
+        
+        // create new hashed request
+        byte[] digest = calculateMessageDigest(file, digestAlgorithm);
+        TimeStampRequest tsq = getTSRequest(digest, algID);
+        
+        return tsq;
     }
 
     /**
@@ -138,6 +326,27 @@ public class TSAConnector {
         Path path = Paths.get(filename);
 
         return Files.readAllBytes(path);
+    }
+    
+    /**
+     * converts InputStream to byte array
+     * 
+     * @param is
+     * @return
+     * @throws IOException 
+     */
+    public byte[] getBytesFromInputStream(InputStream is) throws IOException {
+        try (ByteArrayOutputStream os = new ByteArrayOutputStream();)
+        {
+            byte[] buffer = new byte[0xFFFF];
+
+            for (int len; (len = is.read(buffer)) != -1;)
+                os.write(buffer, 0, len);
+
+            os.flush();
+
+            return os.toByteArray();
+        }
     }
 
     /**

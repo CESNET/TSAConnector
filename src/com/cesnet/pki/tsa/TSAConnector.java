@@ -52,8 +52,8 @@ import org.bouncycastle.util.CollectionStore;
  */
 public class TSAConnector {
     private static final Logger logger = LogManager.getLogger();
-    public final String server = "http://tsa.cesnet.cz:3161/tsa";
-//    public final String server = "https://tsa-dev.cesnet.cz:8442/signserver/tsa?workerName=TimeStampSigner";
+//    public final String server = "http://tsa.cesnet.cz:3161/tsa";
+    public final String server = "https://tsa-dev.cesnet.cz:8442/signserver/tsa?workerName=TimeStampSigner";
     
     // <editor-fold defaultstate="collapsed" desc="legacy main method for testing purposes">
     //
